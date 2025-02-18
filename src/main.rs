@@ -1,5 +1,6 @@
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
@@ -9,6 +10,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleRate;
 use earshot::{VoiceActivityDetector, VoiceActivityModel, VoiceActivityProfile};
 use wav_io::writer::Writer;
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -19,7 +23,13 @@ struct Args {
 
     /// path to the whisper.cpp binary
     #[arg(short, long, value_name = "FILE")]
-    whisper_cpp: PathBuf,
+    whisper_cpp: Option<PathBuf>,
+
+    /// path to a file to transcribe
+    ///
+    /// Transcribes the file instead of the microphone stream
+    #[arg(short, long, value_name = "FILE")]
+    file: Option<PathBuf>,
 }
 
 fn main() {
@@ -29,6 +39,20 @@ fn main() {
 
 const SAMPLE_RATE: usize = 16000;
 fn whisper(args: Args) {
+    if let Some(file) = args.file {
+        let (_header, waveform) =
+            wav_io::read_from_file(File::open(file).expect("file doesnt exist"))
+                .expect("invalid wav file");
+        let samples = wav_io::convert_samples_f32_to_i16(&waveform);
+        let now = Instant::now();
+        match args.whisper_cpp.clone() {
+            Some(bin) => decode_bin(args.model.clone(), bin, &samples),
+            None => decode_first(&mut Whisper::new(args.model), &samples),
+        }
+        println!("\t@{:?}", now.elapsed());
+        return;
+    }
+    let mut whisper = Whisper::new(&args.model);
     let host = cpal::default_host();
     let mic = host.default_input_device().expect("no mic");
     eprintln!("using audio: '{}'", mic.name().unwrap());
@@ -88,56 +112,12 @@ fn whisper(args: Args) {
             if speech.is_some_and(|last: Instant| last.elapsed() < Duration::from_millis(95)) {
                 // linger 3 segments to allow the word to finish
             } else if speech
-                .is_some_and(|last: Instant| last.elapsed() > Duration::from_millis(750))
+                .is_some_and(|last: Instant| last.elapsed() > Duration::from_millis(250))
             {
-                let header = wav_io::new_header(SAMPLE_RATE as u32, 16, false, true);
-                // wav_io::writer::i16samples_to_file(
-                //     &mut File::create("output.wav").unwrap(),
-                //     &header,
-                //     &accumulator[..head].to_vec(),
-                // )
-                // .expect("could not write tmpfile");
-                let mut writer = Writer::new();
-                writer
-                    .from_scratch_i16(&header, &accumulator[..head].to_vec())
-                    .expect("could not turn into wav file");
-                let bytes = writer.to_bytes();
-
-                let mut out = Command::new(args.whisper_cpp.clone())
-                    .arg("--no-prints")
-                    .arg("--no-timestamps")
-                    .arg("-f")
-                    .arg("-") // read from stdin
-                    .arg("-m")
-                    .arg(args.model.clone().into_os_string())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .spawn()
-                    .expect("could not execute child");
-                out.stdin
-                    .as_mut()
-                    .expect("child should have stdin")
-                    .write_all(&bytes)
-                    .expect("could not pipe audio");
-                out.wait().expect("whisper.cpp should not error");
-                let mut lines = String::new();
-                out.stdout
-                    .take()
-                    .expect("whisper.cpp should have an stdout")
-                    .read_to_string(&mut lines)
-                    .expect("whisper.cpp output should be utf8");
-                let stdout = lines
-                    .strip_prefix('\n')
-                    .expect("output from this tool should have a leading newline");
-                if !stdout.is_empty() {
-                    print!(
-                        "{}",
-                        &stdout
-                            .strip_prefix(' ')
-                            .expect("output from this tool should have a leading space")
-                    );
+                match args.whisper_cpp.clone() {
+                    Some(bin) => decode_bin(args.model.clone(), bin, &accumulator[..head]),
+                    None => decode_first(&mut whisper, &accumulator[..head]),
                 }
-                // decode_first(&mut state, params.clone(), &float_samples[..head]);
                 println!("\t@{:?}", speech.unwrap().elapsed());
                 accumulator.fill(0);
                 head = HEAD_ZERO;
@@ -161,5 +141,101 @@ fn whisper(args: Args) {
             continue;
         }
         panic!("overrun case not handled");
+    }
+}
+
+fn decode_bin(model: PathBuf, binary: PathBuf, samples: &[i16]) {
+    let header = wav_io::new_header(SAMPLE_RATE as u32, 16, false, true);
+    let mut writer = Writer::new();
+    writer
+        .from_scratch_i16(&header, &samples.to_vec())
+        .expect("could not turn into wav file");
+    let bytes = writer.to_bytes();
+
+    let mut out = Command::new(binary)
+        .arg("--no-prints")
+        .arg("--no-timestamps")
+        .arg("-f")
+        .arg("-") // read from stdin
+        .arg("-m")
+        .arg(model.clone().into_os_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("could not execute child");
+    out.stdin
+        .as_mut()
+        .expect("child should have stdin")
+        .write_all(&bytes)
+        .expect("could not pipe audio");
+    out.wait().expect("whisper.cpp should not error");
+    let mut lines = String::new();
+    out.stdout
+        .take()
+        .expect("whisper.cpp should have an stdout")
+        .read_to_string(&mut lines)
+        .expect("whisper.cpp output should be utf8");
+    let stdout = lines
+        .strip_prefix('\n')
+        .expect("output from this tool should have a leading newline");
+    if !stdout.is_empty() {
+        print!(
+            "{}",
+            &stdout
+                .strip_prefix(' ')
+                .expect("output from this tool should have a leading space")
+        );
+    }
+}
+
+struct Whisper {
+    state: WhisperState,
+    params: FullParams<'static, 'static>,
+}
+
+impl Whisper {
+    pub fn new(model: impl AsRef<Path>) -> Whisper {
+        let params = WhisperContextParameters::default();
+        let ctx = WhisperContext::new_with_params(
+            model.as_ref().to_str().expect("path should be utf8"),
+            params,
+        )
+        .expect("could not load model");
+        // now we can run the model
+        let state = ctx.create_state().expect("failed to create state");
+
+        // create a params object
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_n_threads(4);
+        params.set_no_timestamps(true);
+        params.set_suppress_non_speech_tokens(false);
+
+        Whisper { state, params }
+    }
+}
+
+fn decode_first(whisper: &mut Whisper, samples: &[i16]) {
+    let mut float_samples = [0f32; SAMPLE_RATE * 30];
+    whisper_rs::convert_integer_to_float_audio(&samples[..], &mut float_samples[..samples.len()])
+        .expect("should be able to de-quantize data");
+
+    eprintln!("running transcription with {}", samples.len());
+    whisper
+        .state
+        .full(whisper.params.clone(), &float_samples)
+        .expect("failed to run model");
+
+    // fetch the results
+    let num_segments = whisper
+        .state
+        .full_n_segments()
+        .expect("failed to get number of segments");
+
+    for i in 0..num_segments {
+        let segment = whisper
+            .state
+            .full_get_segment_text(i)
+            .expect("should have a segment");
+        println!("{segment}");
     }
 }
