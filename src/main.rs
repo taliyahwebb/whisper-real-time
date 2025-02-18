@@ -1,27 +1,34 @@
-use std::env::args;
-use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
+use clap::{arg, Parser};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleRate;
 use earshot::{VoiceActivityDetector, VoiceActivityModel, VoiceActivityProfile};
-use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
-};
+use wav_io::writer::Writer;
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// path to the whisper.cpp model to be used
+    #[arg(short, long, value_name = "FILE")]
+    model: PathBuf,
+
+    /// path to the whisper.cpp binary
+    #[arg(short, long, value_name = "FILE")]
+    whisper_cpp: PathBuf,
+}
 
 fn main() {
-    let model = args()
-        .skip(1)
-        .next()
-        .unwrap_or("./ggml-tiny.en.bin".into())
-        .into();
-    whisper(model);
+    let args = Args::parse();
+    whisper(args);
 }
 
 const SAMPLE_RATE: usize = 16000;
-fn whisper(model: PathBuf) {
+fn whisper(args: Args) {
     let host = cpal::default_host();
     let mic = host.default_input_device().expect("no mic");
     eprintln!("using audio: '{}'", mic.name().unwrap());
@@ -62,61 +69,80 @@ fn whisper(model: PathBuf) {
         .expect("config should be able to work");
     stream.play().expect("could not listen to microphone");
 
-    let mut params = WhisperContextParameters::default();
-    params.flash_attn(true);
-    let ctx = WhisperContext::new_with_params(model.to_str().expect("path should be utf8"), params)
-        .expect("could not load model");
-
-    // create a params object
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(10);
-
-    // now we can run the model
-    let mut state = ctx.create_state().expect("failed to create state");
-    eprintln!("model loaded");
-
     let mut vad = VoiceActivityDetector::new_with_model(
         VoiceActivityModel::ES_ALPHA,
         VoiceActivityProfile::VERY_AGGRESSIVE,
     );
 
-    // assume we have a buffer of audio data
-    // here we'll make a fake one, floating point samples, 32 bit, 16KHz, mono
-    // let file = File::open("output.wav").expect("no test file");
-    // let (_header, samples) = wav_io::read_from_file(file).expect("parsing
-    // error"); let start = Instant::now();
-    // decode_first(&mut state, params.clone(), &samples[..]);
-    // println!("transcription took {:?}", start.elapsed());
-    // return;
-
     let mut speech = None;
-    let mut float_samples = [0f32; SAMPLE_RATE * 30];
+
     let mut accumulator = [0i16; SAMPLE_RATE * 30];
-    let mut head = 0;
+    const HEAD_ZERO: usize = 1600 * 7; // prepend 700ms of silence so single word statements get picked up
+    let mut head = HEAD_ZERO;
+
     while let Ok(partial) = rx.recv() {
         let predict = vad
             .predict_16khz(&partial)
             .expect("should be able to predict audio");
         if !predict {
-            if speech.is_some_and(|last: Instant| last.elapsed() < Duration::from_millis(50)) {
+            if speech.is_some_and(|last: Instant| last.elapsed() < Duration::from_millis(95)) {
+                // linger 3 segments to allow the word to finish
             } else if speech
-                .is_some_and(|last: Instant| last.elapsed() > Duration::from_millis(500))
+                .is_some_and(|last: Instant| last.elapsed() > Duration::from_millis(750))
             {
-                whisper_rs::convert_integer_to_float_audio(&accumulator[..], &mut float_samples)
-                    .expect("should be able to de-quantize data");
-                // let header = wav_io::new_header(SAMPLE_RATE as u32, 32, true, true);
-                // wav_io::write_to_file(
+                let header = wav_io::new_header(SAMPLE_RATE as u32, 16, false, true);
+                // wav_io::writer::i16samples_to_file(
                 //     &mut File::create("output.wav").unwrap(),
                 //     &header,
-                //     &float_samples[..head].to_vec(),
+                //     &accumulator[..head].to_vec(),
                 // )
-                // .unwrap();
-                decode_first(&mut state, params.clone(), &float_samples[..head]);
-                eprintln!("@{:?}", speech.unwrap().elapsed());
+                // .expect("could not write tmpfile");
+                let mut writer = Writer::new();
+                writer
+                    .from_scratch_i16(&header, &accumulator[..head].to_vec())
+                    .expect("could not turn into wav file");
+                let bytes = writer.to_bytes();
+
+                let mut out = Command::new(args.whisper_cpp.clone())
+                    .arg("--no-prints")
+                    .arg("--no-timestamps")
+                    .arg("-f")
+                    .arg("-") // read from stdin
+                    .arg("-m")
+                    .arg(args.model.clone().into_os_string())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("could not execute child");
+                out.stdin
+                    .as_mut()
+                    .expect("child should have stdin")
+                    .write_all(&bytes)
+                    .expect("could not pipe audio");
+                out.wait().expect("whisper.cpp should not error");
+                let mut lines = String::new();
+                out.stdout
+                    .take()
+                    .expect("whisper.cpp should have an stdout")
+                    .read_to_string(&mut lines)
+                    .expect("whisper.cpp output should be utf8");
+                let stdout = lines
+                    .strip_prefix('\n')
+                    .expect("output from this tool should have a leading newline");
+                if !stdout.is_empty() {
+                    print!(
+                        "{}",
+                        &stdout
+                            .strip_prefix(' ')
+                            .expect("output from this tool should have a leading space")
+                    );
+                }
+                // decode_first(&mut state, params.clone(), &float_samples[..head]);
+                println!("\t@{:?}", speech.unwrap().elapsed());
                 accumulator.fill(0);
-                head = 0;
+                head = HEAD_ZERO;
                 speech = None;
-                continue;
+                continue; // skip the sample
             } else {
                 continue; // skip the sample
             }
@@ -134,37 +160,6 @@ fn whisper(model: PathBuf) {
             head += max;
             continue;
         }
-        whisper_rs::convert_integer_to_float_audio(&accumulator[..], &mut float_samples)
-            .expect("should be able to de-quantize data");
-        decode_first(&mut state, params.clone(), &float_samples[..head]);
-        eprintln!("\t@{:?}", speech.unwrap().elapsed());
-        accumulator.fill(0);
-        head = 0;
-        speech = None;
+        panic!("overrun case not handled");
     }
-}
-
-fn decode_first(state: &mut WhisperState, params: FullParams, samples: &[f32]) -> Option<String> {
-    eprintln!("running transcription with {}", samples.len());
-    state.full(params, &samples).expect("failed to run model");
-
-    // fetch the results
-    let num_segments = state
-        .full_n_segments()
-        .expect("failed to get number of segments");
-
-    for i in 0..num_segments {
-        let segment = state
-            .full_get_segment_text(i)
-            .expect("failed to get segment");
-        let start_timestamp = state
-            .full_get_segment_t0(i)
-            .expect("failed to get segment start timestamp");
-        let end_timestamp = state
-            .full_get_segment_t1(i)
-            .expect("failed to get segment end timestamp");
-        // println!("[{} - {}]: {}", start_timestamp, end_timestamp, segment);
-        println!("{segment}");
-    }
-    return None;
 }
