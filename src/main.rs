@@ -1,3 +1,4 @@
+use core::panic;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -98,49 +99,84 @@ fn whisper(args: Args) {
         VoiceActivityProfile::VERY_AGGRESSIVE,
     );
 
-    let mut speech = None;
+    let mut speech_segment = None;
+    let mut segment = 0;
 
     let mut accumulator = [0i16; SAMPLE_RATE * 30];
     const HEAD_ZERO: usize = 1600 * 7; // prepend 700ms of silence so single word statements get picked up
     let mut head = HEAD_ZERO;
 
+    let dispatch = |whisper: &mut Whisper,
+                    accumulator: &mut [i16; SAMPLE_RATE * 30],
+                    head: &mut usize,
+                    speech_segment: &mut Option<u64>,
+                    segment: &mut u64| {
+        let now = Instant::now();
+        match args.whisper_cpp.clone() {
+            Some(bin) => decode_bin(args.model.clone(), bin, &accumulator[..*head]),
+            None => decode_first(whisper, &accumulator[..*head]),
+        }
+        eprintln!("\t@{:?}", now.elapsed());
+        accumulator.fill(0);
+        *head = HEAD_ZERO;
+        *speech_segment = None;
+        *segment = 0;
+    };
+
     while let Ok(partial) = rx.recv() {
+        if speech_segment.is_some() {
+            segment += 1;
+        }
         let predict = vad
             .predict_16khz(&partial)
             .expect("should be able to predict audio");
         if !predict {
-            if speech.is_some_and(|last: Instant| last.elapsed() < Duration::from_millis(95)) {
-                // linger 3 segments to allow the word to finish
-            } else if speech
-                .is_some_and(|last: Instant| last.elapsed() > Duration::from_millis(250))
-            {
-                match args.whisper_cpp.clone() {
-                    Some(bin) => decode_bin(args.model.clone(), bin, &accumulator[..head]),
-                    None => decode_first(&mut whisper, &accumulator[..head]),
-                }
-                println!("\t@{:?}", speech.unwrap().elapsed());
-                accumulator.fill(0);
-                head = HEAD_ZERO;
-                speech = None;
+            if speech_segment.is_some_and(|last| segment - last <= 3) {
+                // allow 3 more segments after we stop detecting speech (~90ms)
+            } else if speech_segment.is_some_and(|last| segment - last > 8) {
+                // if we have 8 segments of non speech stop listening and dispatch (~240ms)
+                dispatch(
+                    &mut whisper,
+                    &mut accumulator,
+                    &mut head,
+                    &mut speech_segment,
+                    &mut segment,
+                );
                 continue; // skip the sample
             } else {
                 continue; // skip the sample
             }
         }
-        if speech.is_none() {
+        if speech_segment.is_none() {
             eprintln!("started speech");
         }
         if predict {
-            speech = Some(Instant::now());
+            // only update the latest segment id if voice was detected
+            speech_segment = Some(segment);
         }
         if head < accumulator.len() {
             let overflow = (head + partial.len()).saturating_sub(accumulator.len());
             let max = partial.len() - overflow;
-            accumulator[head..(head + max)].copy_from_slice(&partial[..max]);
+            let (used, leftover) = partial
+                .split_at_checked(max)
+                .expect("should be able to split ");
+            accumulator[head..(head + max)].copy_from_slice(used);
             head += max;
+            if max < partial.len() {
+                dispatch(
+                    &mut whisper,
+                    &mut accumulator,
+                    &mut head,
+                    &mut speech_segment,
+                    &mut segment,
+                );
+                accumulator[head..head + leftover.len()].copy_from_slice(leftover);
+                head += leftover.len();
+                speech_segment = Some(segment);
+            }
             continue;
         }
-        panic!("overrun case not handled");
+        panic!("should not be reachable")
     }
 }
 
