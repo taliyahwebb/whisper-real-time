@@ -1,6 +1,8 @@
 [package]
-name = "flakebox-project"
+name = "whisper-real-time"
 version = "0.1.0"
+authors = ["Taliyah Webb <taliyahmail@proton.me>"]
+description = "Provides an interface to openai-whisper for continous transcription of the default input device"
 edition = "2021"
 license = "MIT"
 
