@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::channel;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::{arg, Parser};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -252,7 +252,7 @@ impl Whisper {
 
 fn decode_first(whisper: &mut Whisper, samples: &[i16]) {
     let mut float_samples = [0f32; SAMPLE_RATE * 30];
-    whisper_rs::convert_integer_to_float_audio(&samples[..], &mut float_samples[..samples.len()])
+    whisper_rs::convert_integer_to_float_audio(samples, &mut float_samples[..samples.len()])
         .expect("should be able to de-quantize data");
 
     eprintln!("running transcription with {}", samples.len());
