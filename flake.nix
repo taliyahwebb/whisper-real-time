@@ -18,6 +18,7 @@
       system:
       let
         projectName = "flakebox-project";
+        pkgs = nixpkgs.legacyPackages.${system};
 
         flakeboxLib = flakebox.lib.${system} {
           config = {
@@ -61,7 +62,19 @@
 
         legacyPackages = multiBuild;
 
-        devShells = flakeboxLib.mkShells { };
+        devShells = flakeboxLib.mkShells {
+          nativeBuildInputs = [
+            pkgs.cmake
+            pkgs.pkg-config
+          ];
+          buildInputs = [
+            pkgs.alsa-lib
+            pkgs.vulkan-headers
+            pkgs.vulkan-loader
+            pkgs.shaderc
+            # pkgs.vulkan-validation-layers
+          ];
+        };
       }
     );
 }
