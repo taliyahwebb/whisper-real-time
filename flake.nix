@@ -48,7 +48,16 @@
               craneLib'.overrideArgs {
                 pname = projectName;
                 src = buildSrc;
-                nativeBuildInputs = [ ];
+                nativeBuildInputs = [
+                  pkgs.cmake
+                  pkgs.pkg-config
+                  pkgs.shaderc
+                ];
+                buildInputs = [
+                  pkgs.alsa-lib
+                  pkgs.vulkan-headers
+                  pkgs.vulkan-loader
+                ];
               }
             );
           in
@@ -63,17 +72,7 @@
         legacyPackages = multiBuild;
 
         devShells = flakeboxLib.mkShells {
-          nativeBuildInputs = [
-            pkgs.cmake
-            pkgs.pkg-config
-          ];
-          buildInputs = [
-            pkgs.alsa-lib
-            pkgs.vulkan-headers
-            pkgs.vulkan-loader
-            pkgs.shaderc
-            # pkgs.vulkan-validation-layers
-          ];
+          inputsFrom = [ multiBuild.${projectName} ];
         };
       }
     );
