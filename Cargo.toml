@@ -1,6 +1,6 @@
 [package]
 name = "whisper-real-time"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Taliyah Webb <taliyahmail@proton.me>"]
 description = "Provides an interface to openai-whisper for continous transcription of the default input device"
 edition = "2021"
@@ -12,6 +12,7 @@ license = "MIT"
 clap = { version = "4.5.30", features = ["derive"] }
 cpal = "0.15.3"
 earshot = "0.1.0"
+ringbuf = "0.4.7"
 wav_io = "0.1.15"
 whisper-rs = { version = "0.13.2", features = ["vulkan"] }
 
