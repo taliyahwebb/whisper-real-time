@@ -73,6 +73,7 @@
 
         devShells = flakeboxLib.mkShells {
           inputsFrom = [ multiBuild.${projectName} ];
+          packages = [ pkgs.ffmpeg ];
         };
       }
     );
