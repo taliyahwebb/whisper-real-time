@@ -34,6 +34,14 @@ struct Args {
     /// Transcribes the file instead of the microphone stream
     #[arg(short, long, value_name = "FILE")]
     file: Option<PathBuf>,
+
+    /// list available audio devices
+    #[arg(short, long)]
+    list: bool,
+
+    /// audio device to listen to
+    #[arg(short, long)]
+    device: Option<String>,
 }
 
 fn main() {
@@ -42,6 +50,16 @@ fn main() {
 }
 
 fn whisper(args: Args) {
+    if args.list {
+        let host = cpal::default_host();
+        let devices = host.input_devices().unwrap();
+        eprintln!("Available audio devices:");
+        for dev in devices {
+            println!("- {}", dev.name().expect("couldnt get device name"));
+        }
+        return;
+    }
+
     let whisper_opts = WhisperOptions {
         translate_en: false,
         language: "en".to_string(),
@@ -72,9 +90,12 @@ fn whisper(args: Args) {
         Whisper::with_options(&args.model, whisper_opts).expect("should be able to load whisper");
     let host = cpal::default_host(); // TODO add mic selection
     let mic = host.default_input_device().expect("no mic");
-    let (mic, config) =
-        vad::get_microphone_by_name(&mic.name().expect("default device should have a name"))
-            .expect("should be able to get default mic");
+    let (mic, config) = vad::get_microphone_by_name(
+        &args
+            .device
+            .unwrap_or_else(|| mic.name().expect("default device should have a name")),
+    )
+    .expect("should be able to get default mic");
     eprintln!("using audio: '{}'", mic.name().unwrap());
     let ring = HeapRb::<i16>::try_new(MAX_WHISPER_FRAME * 2).expect("cannot allocate audio ring");
     let (mut producer, mut consumer) = ring.split();
