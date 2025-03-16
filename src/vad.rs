@@ -8,6 +8,7 @@ use earshot::{VoiceActivityDetector, VoiceActivityModel, VoiceActivityProfile};
 use ringbuf::storage::Heap;
 use ringbuf::traits::{Consumer, Observer, Producer};
 use ringbuf::LocalRb;
+use samplerate::Samplerate;
 
 use crate::whisper::SAMPLE_RATE;
 
@@ -133,25 +134,19 @@ impl Vad {
 }
 
 pub fn audio_loop(
-    data: &[i16],
-    resample_from: Option<u32>,
+    data: &[f32],
+    resample_from: &Option<Samplerate>,
     ring_buffer: &mut impl Producer<Item = i16>,
     vad: &mut Vad,
     activity: &mut Sender<VadActivity>,
 ) {
-    // TODO: move resampling out of audio loop and replace this incredibly
-    // inefficient 4x copy pipeline
     let data = match resample_from {
         None => data,
-        Some(src_rate) => &wav_io::convert_samples_f32_to_i16(&wav_io::resample::linear(
-            wav_io::convert_samples_i16_to_f32(&data.to_vec()),
-            1,
-            src_rate,
-            SAMPLE_RATE as u32,
-        ))[..],
+        Some(resampler) => &resampler.process(data).expect("should be able to resample"),
     };
+    let data = wav_io::convert_samples_f32_to_i16(&data.to_vec());
 
-    vad.input(data);
+    vad.input(&data);
     loop {
         let status = vad.output_to(ring_buffer);
         match status {
@@ -216,5 +211,24 @@ pub fn get_microphone_by_name(name: &str) -> Result<(Device, StreamConfig), Audi
         Ok((device, config))
     } else {
         Err(AudioError::InputDeviceUnavailable(name.into()))
+    }
+}
+
+pub fn get_resampler(src_rate: u32) -> Option<Samplerate> {
+    if src_rate != SAMPLE_RATE as u32 {
+        eprintln!(
+            "running with resampling src{:?}->dest{SAMPLE_RATE}",
+            src_rate
+        );
+        let resampler = Samplerate::new(
+            samplerate::ConverterType::SincFastest,
+            src_rate,
+            SAMPLE_RATE as u32,
+            1,
+        )
+        .expect("should be able to build resampler");
+        Some(resampler)
+    } else {
+        None
     }
 }

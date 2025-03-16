@@ -111,8 +111,7 @@ impl Whisper {
             // this should not happen as we have enabled the single segment option
             eprintln!("more then one text segment received from whisper, dropping others");
         }
-        return self
-            .state
+        self.state
             .full_get_segment_text(0)
             .ok()
             // filter hallucination
@@ -122,6 +121,6 @@ impl Whisper {
                 } else {
                     Some(text)
                 }
-            });
+            })
     }
 }

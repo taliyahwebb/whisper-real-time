@@ -13,6 +13,7 @@ clap = { version = "4.5.30", features = ["derive"] }
 cpal = "0.15.3"
 earshot = "0.1.0"
 ringbuf = "0.4.7"
+samplerate = "0.2.4"
 wav_io = "0.1.15"
 whisper-rs = { version = "0.13.2", features = ["vulkan"] }
 

@@ -9,11 +9,10 @@ use std::time::{Duration, Instant};
 
 use clap::{arg, Parser};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, SampleRate, Stream};
+use cpal::{BufferSize, Stream};
 use ringbuf::traits::{Consumer, Split};
 use ringbuf::HeapRb;
-use vad::{Vad, VadActivity};
-use wav_io::header::SampleFormat;
+use vad::{get_resampler, Vad, VadActivity};
 use wav_io::writer::Writer;
 use whisper::{Whisper, WhisperOptions, MAX_WHISPER_FRAME, SAMPLE_RATE};
 
@@ -94,66 +93,59 @@ fn whisper(args: Args) {
         let (header, waveform) =
             wav_io::read_from_file(File::open(file).expect("file doesnt exist"))
                 .expect("invalid wav file");
-        let resample_from = if header.sample_rate != SAMPLE_RATE as u32 {
-            eprintln!(
-                "running with resampling src{:?}->dest{SAMPLE_RATE}",
-                config.sample_rate.0
-            );
-            Some(config.sample_rate.0)
-        } else {
-            None
-        };
-        let waveform = wav_io::convert_samples_f32_to_i16(&waveform);
         let buf_size = if let BufferSize::Fixed(val) = config.buffer_size {
             val as usize
         } else {
             panic!("invalid config used. use a config with fixed buffer size");
         };
         let handle = thread::spawn(move || {
+            let resample_with = get_resampler(header.sample_rate);
             for chunk in waveform.chunks(buf_size) {
+                let now = Instant::now();
+                let timeout =
+                    Duration::from_millis((chunk.len() as u64 * 1000) / header.sample_rate as u64);
                 vad::audio_loop(
                     chunk,
-                    resample_from,
+                    &resample_with,
                     &mut producer,
                     &mut vad,
                     &mut activity_tx,
                 );
-                thread::sleep(Duration::from_millis(
-                    (chunk.len() as u64 * 1000) / SAMPLE_RATE as u64,
-                ));
+                let delta = Instant::now() - now;
+                thread::sleep(timeout - delta);
             }
         });
         StreamHandle::Thread(handle)
     } else {
-        let resample_from = if config.sample_rate.0 != SAMPLE_RATE as u32 {
-            eprintln!(
-                "running with resampling src{:?}->dest{SAMPLE_RATE}",
-                config.sample_rate.0
-            );
-            Some(config.sample_rate.0)
-        } else {
-            None
-        };
-        let stream = mic
-            .build_input_stream(
-                &config,
-                move |data: &[i16], _info| {
-                    vad::audio_loop(
-                        data,
-                        resample_from,
-                        &mut producer,
-                        &mut vad,
-                        &mut activity_tx,
-                    );
-                },
-                move |err| {
-                    eprintln!("error: {err}");
-                },
-                None,
-            )
-            .expect("config should be able to work");
-        stream.play().expect("could not listen to microphone");
-        StreamHandle::Stream(stream)
+        let handle = thread::spawn(move || {
+            let resample_with = get_resampler(config.sample_rate.0);
+            let (audio_tx, audio_rx) = mpsc::sync_channel(0);
+            let stream = mic
+                .build_input_stream(
+                    &config,
+                    move |data: &[f32], _info| {
+                        if audio_tx.try_send(data.to_vec()).is_err() {
+                            eprintln!("audio is being dropped");
+                        }
+                    },
+                    move |err| {
+                        eprintln!("error: {err}");
+                    },
+                    None,
+                )
+                .expect("config should be able to work");
+            stream.play().expect("could not listen to microphone");
+            while let Ok(data) = audio_rx.recv() {
+                vad::audio_loop(
+                    &data,
+                    &resample_with,
+                    &mut producer,
+                    &mut vad,
+                    &mut activity_tx,
+                );
+            }
+        });
+        StreamHandle::Thread(handle)
     };
 
     while let Ok(event) = activity_rx.recv() {
