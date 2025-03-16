@@ -24,6 +24,7 @@ pub enum VadStatus {
 
 #[derive(Debug)]
 pub enum AudioError {
+    #[allow(dead_code)] // this is implicitly read during except via debug
     InputDeviceUnavailable(String),
 }
 
@@ -194,7 +195,6 @@ pub fn get_microphone_by_name(name: &str) -> Result<(Device, StreamConfig), Audi
                 } else {
                     config.max_sample_rate()
                 };
-                eprintln!("running with resampling src{dev_rate:?}->dest{SAMPLE_RATE}",);
                 config.with_sample_rate(dev_rate)
             });
         let buffer_size = BufferSize::Fixed(match config.buffer_size() {

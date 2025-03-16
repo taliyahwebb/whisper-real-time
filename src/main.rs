@@ -4,14 +4,16 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self};
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use clap::{arg, Parser};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::SampleRate;
+use cpal::{BufferSize, SampleRate, Stream};
 use ringbuf::traits::{Consumer, Split};
 use ringbuf::HeapRb;
 use vad::{Vad, VadActivity};
+use wav_io::header::SampleFormat;
 use wav_io::writer::Writer;
 use whisper::{Whisper, WhisperOptions, MAX_WHISPER_FRAME, SAMPLE_RATE};
 
@@ -49,6 +51,15 @@ fn main() {
     whisper(args);
 }
 
+// this is a drop guard/container object
+// no need to read the values
+enum StreamHandle {
+    #[allow(dead_code)]
+    Thread(JoinHandle<()>),
+    #[allow(dead_code)]
+    Stream(Stream),
+}
+
 fn whisper(args: Args) {
     if args.list {
         let host = cpal::default_host();
@@ -64,28 +75,6 @@ fn whisper(args: Args) {
         translate_en: false,
         language: "en".to_string(),
     };
-    if let Some(file) = args.file {
-        let (_header, waveform) =
-            wav_io::read_from_file(File::open(file).expect("file doesnt exist"))
-                .expect("invalid wav file");
-        let samples = wav_io::convert_samples_f32_to_i16(&waveform);
-        let now = Instant::now();
-        match args.whisper_cpp.clone() {
-            Some(bin) => decode_bin(args.model.clone(), bin, &samples),
-            None => {
-                let mut whisper = Whisper::with_options(args.model, whisper_opts)
-                    .expect("should be able to load whisper");
-                let buf = whisper.audio_buf(samples.len());
-                buf.copy_from_slice(&samples);
-                match whisper.transcribe() {
-                    Some(text) => println!("{text}"),
-                    None => println!("[silence]"),
-                }
-            }
-        }
-        println!("\t@{:?}", now.elapsed());
-        return;
-    }
     let mut whisper =
         Whisper::with_options(&args.model, whisper_opts).expect("should be able to load whisper");
     let host = cpal::default_host(); // TODO add mic selection
@@ -101,30 +90,71 @@ fn whisper(args: Args) {
     let (mut producer, mut consumer) = ring.split();
     let (mut activity_tx, activity_rx) = mpsc::channel::<VadActivity>();
     let mut vad = Vad::try_new(&config).expect("should be able to build vad");
-    let resample_from = if config.sample_rate.0 != SAMPLE_RATE as u32 {
-        Some(config.sample_rate.0)
-    } else {
-        None
-    };
-    let stream = mic
-        .build_input_stream(
-            &config,
-            move |data: &[i16], _info| {
+    let _handle = if let Some(file) = args.file {
+        let (header, waveform) =
+            wav_io::read_from_file(File::open(file).expect("file doesnt exist"))
+                .expect("invalid wav file");
+        let resample_from = if header.sample_rate != SAMPLE_RATE as u32 {
+            eprintln!(
+                "running with resampling src{:?}->dest{SAMPLE_RATE}",
+                config.sample_rate.0
+            );
+            Some(config.sample_rate.0)
+        } else {
+            None
+        };
+        let waveform = wav_io::convert_samples_f32_to_i16(&waveform);
+        let buf_size = if let BufferSize::Fixed(val) = config.buffer_size {
+            val as usize
+        } else {
+            panic!("invalid config used. use a config with fixed buffer size");
+        };
+        let handle = thread::spawn(move || {
+            for chunk in waveform.chunks(buf_size) {
                 vad::audio_loop(
-                    data,
+                    chunk,
                     resample_from,
                     &mut producer,
                     &mut vad,
                     &mut activity_tx,
                 );
-            },
-            move |err| {
-                eprintln!("error: {err}");
-            },
-            None,
-        )
-        .expect("config should be able to work");
-    stream.play().expect("could not listen to microphone");
+                thread::sleep(Duration::from_millis(
+                    (chunk.len() as u64 * 1000) / SAMPLE_RATE as u64,
+                ));
+            }
+        });
+        StreamHandle::Thread(handle)
+    } else {
+        let resample_from = if config.sample_rate.0 != SAMPLE_RATE as u32 {
+            eprintln!(
+                "running with resampling src{:?}->dest{SAMPLE_RATE}",
+                config.sample_rate.0
+            );
+            Some(config.sample_rate.0)
+        } else {
+            None
+        };
+        let stream = mic
+            .build_input_stream(
+                &config,
+                move |data: &[i16], _info| {
+                    vad::audio_loop(
+                        data,
+                        resample_from,
+                        &mut producer,
+                        &mut vad,
+                        &mut activity_tx,
+                    );
+                },
+                move |err| {
+                    eprintln!("error: {err}");
+                },
+                None,
+            )
+            .expect("config should be able to work");
+        stream.play().expect("could not listen to microphone");
+        StreamHandle::Stream(stream)
+    };
 
     while let Ok(event) = activity_rx.recv() {
         match event {
