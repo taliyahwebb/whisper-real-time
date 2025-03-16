@@ -9,6 +9,7 @@ use ringbuf::storage::Heap;
 use ringbuf::traits::{Consumer, Observer, Producer};
 use ringbuf::LocalRb;
 use samplerate::Samplerate;
+use wav_io::utils::stereo_to_mono;
 
 use crate::whisper::SAMPLE_RATE;
 
@@ -50,7 +51,7 @@ impl Vad {
         let BufferSize::Fixed(buffer_size) = config.buffer_size else {
             return Err("config doesnt allow safe vad setup");
         };
-        let ring = LocalRb::new(buffer_size.max(VAD_FRAME as u32 * 2) as usize);
+        let ring = LocalRb::new((buffer_size * 2).max(VAD_FRAME as u32 * 2) as usize);
         Ok(Vad {
             vad: VoiceActivityDetector::new_with_model(
                 VoiceActivityModel::ES_ALPHA,
@@ -135,11 +136,18 @@ impl Vad {
 
 pub fn audio_loop(
     data: &[f32],
+    channels: u16,
     resample_from: &Option<Samplerate>,
     ring_buffer: &mut impl Producer<Item = i16>,
     vad: &mut Vad,
     activity: &mut Sender<VadActivity>,
 ) {
+    let data = match channels {
+        1 => data,
+        2 => &stereo_to_mono(data.to_vec()),
+        n => panic!("configs with {n} channels are not supported"),
+    };
+
     let data = match resample_from {
         None => data,
         Some(resampler) => &resampler.process(data).expect("should be able to resample"),
@@ -194,15 +202,21 @@ pub fn get_microphone_by_name(name: &str) -> Result<(Device, StreamConfig), Audi
             });
         let buffer_size = BufferSize::Fixed(match config.buffer_size() {
             cpal::SupportedBufferSize::Range { min, max } => ((config.sample_rate().0 / 30)
-                .next_multiple_of(48))
-            .max(*min)
-            .min(*max),
+                * config.channels() as u32)
+                .max(*min)
+                .min(*max),
             cpal::SupportedBufferSize::Unknown => {
-                (config.sample_rate().0 / 30).next_multiple_of(48)
+                (config.sample_rate().0 / 30) * config.channels() as u32
             }
         });
         let sample_rate = config.sample_rate();
         let channels = config.channels();
+        if channels > 2 {
+            return Err(AudioError::InputDeviceUnavailable(format!(
+                "{} has more then two channels. Only Mono and Stereo audio is supported",
+                name
+            )));
+        }
         let config = StreamConfig {
             channels,
             sample_rate,

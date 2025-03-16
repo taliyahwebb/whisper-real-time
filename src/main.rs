@@ -13,6 +13,7 @@ use cpal::{BufferSize, Stream};
 use ringbuf::traits::{Consumer, Split};
 use ringbuf::HeapRb;
 use vad::{get_resampler, Vad, VadActivity};
+use wav_io::header;
 use wav_io::writer::Writer;
 use whisper::{Whisper, WhisperOptions, MAX_WHISPER_FRAME, SAMPLE_RATE};
 
@@ -93,19 +94,19 @@ fn whisper(args: Args) {
         let (header, waveform) =
             wav_io::read_from_file(File::open(file).expect("file doesnt exist"))
                 .expect("invalid wav file");
-        let buf_size = if let BufferSize::Fixed(val) = config.buffer_size {
-            val as usize
-        } else {
-            panic!("invalid config used. use a config with fixed buffer size");
-        };
+        let buf_size = (header.sample_rate / 30) * header.channels as u32;
         let handle = thread::spawn(move || {
             let resample_with = get_resampler(header.sample_rate);
-            for chunk in waveform.chunks(buf_size) {
+            if header.channels == 2 {
+                eprintln!("converting stereo to mono audio");
+            }
+            for chunk in waveform.chunks(buf_size as usize) {
                 let now = Instant::now();
                 let timeout =
                     Duration::from_millis((chunk.len() as u64 * 1000) / header.sample_rate as u64);
                 vad::audio_loop(
                     chunk,
+                    header.channels,
                     &resample_with,
                     &mut producer,
                     &mut vad,
@@ -119,6 +120,9 @@ fn whisper(args: Args) {
     } else {
         let handle = thread::spawn(move || {
             let resample_with = get_resampler(config.sample_rate.0);
+            if config.channels == 2 {
+                eprintln!("converting stereo to mono audio");
+            }
             let (audio_tx, audio_rx) = mpsc::sync_channel(0);
             let stream = mic
                 .build_input_stream(
@@ -138,6 +142,7 @@ fn whisper(args: Args) {
             while let Ok(data) = audio_rx.recv() {
                 vad::audio_loop(
                     &data,
+                    config.channels,
                     &resample_with,
                     &mut producer,
                     &mut vad,
