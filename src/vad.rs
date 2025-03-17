@@ -13,6 +13,11 @@ use wav_io::utils::stereo_to_mono;
 
 use crate::whisper::SAMPLE_RATE;
 
+/// selectable alsa buffer sizes follow a weird pattern 32 seems to work as a
+/// quantum over a wide range of buffer sizes
+const ALSA_BUFFER_QAUANTUM: u32 = 32;
+const ALSA_BUFFER_MIN: u32 = 32;
+
 /// ~30ms of audio
 pub const VAD_FRAME: usize = 480; // sample count
 
@@ -202,12 +207,13 @@ pub fn get_microphone_by_name(name: &str) -> Result<(Device, StreamConfig), Audi
             });
         let buffer_size = BufferSize::Fixed(match config.buffer_size() {
             cpal::SupportedBufferSize::Range { min, max } => ((config.sample_rate().0 / 30)
-                * config.channels() as u32)
-                .max(*min)
-                .min(*max),
-            cpal::SupportedBufferSize::Unknown => {
-                (config.sample_rate().0 / 30) * config.channels() as u32
-            }
+                .next_multiple_of(ALSA_BUFFER_QAUANTUM)
+                .max(ALSA_BUFFER_MIN))
+            .max(*min)
+            .min(*max),
+            cpal::SupportedBufferSize::Unknown => (config.sample_rate().0 / 30)
+                .next_multiple_of(ALSA_BUFFER_QAUANTUM)
+                .max(ALSA_BUFFER_MIN),
         });
         let sample_rate = config.sample_rate();
         let channels = config.channels();
