@@ -123,7 +123,7 @@ fn whisper(args: Args) {
             if config.channels == 2 {
                 eprintln!("converting stereo to mono audio");
             }
-            let (audio_tx, audio_rx) = mpsc::sync_channel(0);
+            let (audio_tx, audio_rx) = mpsc::sync_channel(10);
             let stream = mic
                 .build_input_stream(
                     &config,
