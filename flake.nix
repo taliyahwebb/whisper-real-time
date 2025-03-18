@@ -5,6 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     flakebox.url = "github:rustshop/flakebox";
+    flakebox.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -17,12 +18,13 @@
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        projectName = "flakebox-project";
+        projectName = "whisper-real-time";
         pkgs = nixpkgs.legacyPackages.${system};
 
         flakeboxLib = flakebox.lib.${system} {
           config = {
-            github.ci.enable = false;
+            github.ci.enable = true;
+            github.ci.workflows.flakebox-flakehub-publish.enable = false;
             semgrep.enable = false;
           };
         };
